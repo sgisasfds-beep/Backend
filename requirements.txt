@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scipy
+openpyxl
+xlrd
+google-genai
+pydantic
+python-dotenv
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+bcrypt
+python-multipart
