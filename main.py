@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
+import json
 from typing import List, Dict, Any, Union
 import scipy.stats as stats
 from google import genai
@@ -156,7 +157,7 @@ app.add_middleware(
 )
 
 CUOTAS = {"MB": 20, "LCM": 20, "CCV": 20, "EA": 20, "RT": 20}
-MATRICES_MUESTRAS = ["agua superficial", "agua subterranea", "ar domestica", "ar no domestica"]
+MATRICES_MUESTRAS = ["agua superficial", "agua subterranea", "ar domestica", "ar no domestica", "arenoso", "arcilloso","limoso"]
 
 def sanear_nan(obj: Any) -> Any:
     """Recorre recursivamente el resultado y reemplaza NaN/Inf (no serializables
@@ -177,10 +178,14 @@ def clasificar_muestra(codigo_raw: Any):
         return None, None
     c = codigo_raw.strip().lower()
     c = " ".join(c.split())
-
-    # Se revisa "no domestica" ANTES que "domestica" para no confundir
+    
+    matriz = None
+    
+    if "arenoso" in c: matriz = "arenoso"
+    elif "arcilloso" in c: matriz = "arcilloso"
+    elif "limoso" in c: matriz = "limoso"
     # "agua residual no domestica" con la matriz doméstica.
-    if "no domestica" in c or "ar no domestica" in c:
+    elif "no domestica" in c or "ar no domestica" in c:
         matriz = "ar no domestica"
     elif "domestica" in c or "ar domestica" in c:
         matriz = "ar domestica"
@@ -824,9 +829,24 @@ async def procesar_datos(
     archivo_config: UploadFile = File(...),
     tipo_analisis: str = Form("estandar"),
     area_analisis: str = Form("metales"),
-    humedad_pw: float = Form(0.0),
-    humedad: float = Form(0.0)
+    humedades_suelos: str = Form("{}")
 ):
+    # JSON esperado: {"arenoso": {"pw": 12.5, "humedad": 12.5}, "arcilloso": {...}, ...}
+    try:
+        dic_humedades = json.loads(humedades_suelos) or {}
+    except Exception:
+        dic_humedades = {}
+
+    MATRICES_SUELO = ["arenoso", "arcilloso", "limoso"]
+
+    def obtener_humedad(matriz):
+        """Humedad (pW en metales / Humedad en fisicoquimico) de una submatriz de suelo."""
+        h_obj = dic_humedades.get(matriz, {}) if matriz else {}
+        clave = "humedad" if area_analisis == "fisicoquimico" else "pw"
+        try:
+            return float(h_obj.get(clave, h_obj.get("pw", h_obj.get("humedad", 0.0))) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
     try:
         contenido_config = await archivo_config.read()
         df_config = pd.read_excel(io.BytesIO(contenido_config), skiprows=1, header=None)
@@ -903,6 +923,12 @@ async def procesar_datos(
                     if pd.notna(val_d) and str(val_d).strip() != "":
                         nuevo_codigo = clasificar_codigo(val_d)
                         matriz_m, tipo_m = clasificar_muestra(val_d)
+                        # Si el usuario eligio suelos, solo cuentan las submatrices de suelo;
+                        # en cualquier otro tipo de analisis, las de suelo se ignoran.
+                        if matriz_m:
+                            es_suelo_m = matriz_m in MATRICES_SUELO
+                            if (tipo_analisis == "suelos") != es_suelo_m:
+                                matriz_m, tipo_m = None, None
                         
                         if nuevo_codigo or matriz_m:
                             # Anclar la fecha del bloque a la fila donde se detectó
@@ -954,7 +980,7 @@ async def procesar_datos(
                                 
                                 # Aplicar cálculo de concentración según matriz
                                 if tipo_analisis == "suelos":
-                                    denominador = peso_actual * ((100 + humedad_pw) / 100)
+                                    denominador = peso_actual * ((100 + obtener_humedad(muestra_actual)) / 100)
                                     if denominador == 0: denominador = 1
                                     conc = (conc_raw * 100) / denominador
                                 elif tipo_analisis == "aire":
@@ -975,7 +1001,8 @@ async def procesar_datos(
                             
                             # Cálculo Matemático según Matriz
                             if tipo_analisis == "suelos":
-                                denominador = peso_actual * ((100 + humedad_pw) / 100)
+                                humedad_usar = obtener_humedad(muestra_actual)
+                                denominador = peso_actual * ((100 + humedad_usar) / 100)
                                 if denominador == 0: 
                                     denominador = 1  # Evita división por cero
                                 conc = (conc_raw * 100) / denominador
@@ -1226,6 +1253,7 @@ async def procesar_datos(
         conc_patron = 1000 if elem in GRUPO_2 else 10
 
         resultados[elem]["muestras"] = {}
+        resultados[elem]["humedad_aplicada_matrices"] = {}
         for matriz_name, datos_m in controles.get("muestras", {}).items():
             res_matriz = []
             len_min = min(len(datos_m["normal"]), len(datos_m["adicionada"]), len(datos_m["duplicada"]))
@@ -1260,7 +1288,9 @@ async def procesar_datos(
             # Solo agregar al JSON si se encontraron réplicas para esta matriz
             if res_matriz:
                 resultados[elem]["muestras"][matriz_name] = res_matriz
-
+                if tipo_analisis == "suelos" and matriz_name in ["arenoso", "arcilloso", "limoso"]:
+                    resultados[elem]["humedad_aplicada_matrices"][matriz_name] = obtener_humedad(matriz_name)
+                    
     if tipo_analisis == "ras":
         nombres_ras = {"Ca": "Ca soluble", "Mg": "Mg soluble", "Na": "Na soluble", "K": "K soluble"}
         resultados_finales = {}
