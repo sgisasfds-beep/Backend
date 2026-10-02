@@ -196,8 +196,8 @@ def clasificar_muestra(codigo_raw: Any):
     else:
         return None, None
 
-    if "adicionado" in c: return matriz, "adicionada"
-    if "duplicado" in c: return matriz, "duplicada"
+    if "adicionad" in c: return matriz, "adicionada"
+    if "duplicad" in c: return matriz, "duplicada"
     return matriz, "normal"
 
 def es_simbolo_quimico(valor: Any) -> bool:
@@ -233,6 +233,41 @@ def extraer_simbolo_factor(texto: str) -> str:
     if len(s) == 1 and s in "AaBbCcDdEeFfGg":
         return s
     return None
+# Si tu Excel ya trae el factor estequiométrico dentro de la normalidad ingresada,
+# cambia esto a False para usar solo ((Vt - Vb) * N) / Vm.
+APLICAR_FACTOR_ESTEQUIOMETRICO = True
+
+# Factor (mg/eq u equivalente) por parámetro, con el nombre normalizado
+# (minúsculas, sin tildes). REVISAR estas fórmulas según tu método.
+FACTORES_VOLUMETRICOS = {
+    "dqo": 8000,
+    "cloruros": 35450,
+    "dureza total": 50000,
+    "dureza calcica": 50000,
+    "alcalinidad": 50000,
+    "acidez total": 100000,
+    "fosfatos": 32600,
+    "nitrogeno kjeldahl": 14000,
+    "nitrogeno amoniacal": 14000,
+}
+
+def calcular_concentracion_volumetrica(parametro, v_titulante, v_blanco, n_titulante, v_muestra):
+    """
+    Aplica el factor estequiométrico correcto según el parámetro.
+    El nombre se normaliza (minúsculas, sin tildes) para evitar fallos de coincidencia.
+    """
+    if not v_muestra:
+        return 0.0
+
+    param = _normalizar_texto(parametro)
+    factor = FACTORES_VOLUMETRICOS.get(param, 1)
+
+    if param == "dqo":
+        # DQO es (Blanco - Muestra) en lugar de (Muestra - Blanco)
+        return ((v_blanco - v_titulante) * n_titulante * factor) / v_muestra
+
+    # Fórmula general (y de respaldo si el parámetro no está en la tabla)
+    return ((v_titulante - v_blanco) * n_titulante * factor) / v_muestra
 
 def procesar_hoja_robustez(contenido_bytes: bytes, area_analisis: str = "metales") -> Dict[str, Any]:
     """Procesa la pestaña 'Robustez' y 'Hoja1' del archivo Formato.xlsx (estandares.xlsx)."""
@@ -369,8 +404,13 @@ def procesar_hoja_robustez(contenido_bytes: bytes, area_analisis: str = "metales
                                     if pd.notna(val_conc):
                                         try:
                                             conc = float(str(val_conc).replace(",", "."))
+                                            # Fecha: columna inmediatamente anterior a la del "FACTOR X"
+                                            fecha_rob = (
+                                                formatear_fecha_celda(df.iloc[curr_r, c - 1], "Sin Fecha")
+                                                if c >= 1 else "Sin Fecha"
+                                            )
                                             pool_fq_robustez[p_key]["datos"][simbolo].append({
-                                                "fecha": "Sin Fecha",
+                                                "fecha": fecha_rob,
                                                 "valor": conc,
                                                 "analista": analista
                                             })
@@ -405,6 +445,127 @@ def procesar_hoja_robustez(contenido_bytes: bytes, area_analisis: str = "metales
 
     return resultados
 
+def procesar_hoja_titulados(contenido_bytes, fecha):
+    """
+    Procesa la pestaña 'Titulados' para fisicoquímica.
+    Las columnas clave respecto al rótulo (MB, CCV, EA, muestra) son:
+    +1: Analista
+    +2: Volumen de Titulación del Blanco (Vb)
+    +4: Volumen de Muestra (Vm)
+    +5: Volumen de Titulante (Vt)
+    +6: Concentración del Titulante (Nt)
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(contenido_bytes), sheet_name="Titulados", header=None)
+    except Exception:
+        # Si la hoja no existe en el archivo excel, devolvemos un diccionario vacío.
+        return {}
+
+    pool_titulados = {}
+    filas, columnas = df.shape
+
+    # 1. Encontrar bloques buscando "PARAMETRO"
+    ocurrencias = []
+    for r in range(filas):
+        for c in range(columnas):
+            val = str(df.iloc[r, c]).strip().upper()
+            if "PARAMETRO" in val:
+                ocurrencias.append((r, c))
+
+    filas_por_columna = {}
+    for (r, c) in ocurrencias:
+        filas_por_columna.setdefault(c, []).append(r)
+    for c in filas_por_columna:
+        filas_por_columna[c].sort()
+
+    for (row_idx, col_param) in ocurrencias:
+        if col_param + 2 >= columnas:
+            continue
+
+        nombre_parametro = str(df.iloc[row_idx, col_param + 2]).strip()
+        if nombre_parametro not in pool_titulados:
+            pool_titulados[nombre_parametro] = {
+                "MB": [], "LCM": [], "CCV": [], "EA": [], "RT": [],
+                "muestras": {m: {"normal": [], "adicionada": [], "duplicada": []} for m in MATRICES_MUESTRAS},
+                "es_titulado": True # Flag para el Frontend
+            }
+
+        siguientes = [f for f in filas_por_columna[col_param] if f > row_idx]
+        fin_bloque = siguientes[0] if siguientes else filas
+
+        curr_row = row_idx + 2
+
+        while curr_row < fin_bloque:
+            celda_actual = str(df.iloc[curr_row, col_param]).strip().upper()
+
+            if celda_actual == "" or celda_actual == "NAN":
+                curr_row += 1
+                continue
+            
+            # Variables volumétricas (con validación de seguridad si la celda no existe o está vacía)
+            def leer_vol(offset):
+                if col_param + offset >= columnas: return 0.0
+                try: return float(str(df.iloc[curr_row, col_param + offset]).replace(",", "."))
+                except (ValueError, TypeError): return 0.0
+
+            # Extracción de los volúmenes en las posiciones que indicaste
+            v_blanco = leer_vol(2)
+            v_muestra = leer_vol(3)
+            v_titulante = leer_vol(4)
+            n_titulante = leer_vol(5)
+            
+
+            # Concentración = ((Vt - Vb) * N * Factor) / Vm
+            # El factor por parámetro se define en FACTORES_VOLUMETRICOS
+            # (se puede desactivar con APLICAR_FACTOR_ESTEQUIOMETRICO).
+            valor_calculado = 0.0
+            if v_muestra > 0:
+                if APLICAR_FACTOR_ESTEQUIOMETRICO:
+                    valor_calculado = calcular_concentracion_volumetrica(
+                        nombre_parametro, v_titulante, v_blanco, n_titulante, v_muestra
+                    )
+                else:
+                    valor_calculado = ((v_titulante - v_blanco) * n_titulante) / v_muestra
+
+            # Construir el objeto de lectura que se enviará al pool
+            fecha_fila = formatear_fecha_celda(df.iloc[curr_row, col_param - 1], fecha) if col_param >= 1 else fecha
+            analista_raw = str(df.iloc[curr_row, col_param + 1]).strip() if col_param + 1 < columnas else "Analista 1"
+            analista = "Analista 1" if "1" in analista_raw else "Analista 2"
+            
+            datos_lectura = {
+                "valor": valor_calculado,
+                "fecha": fecha_fila,
+                "analista": analista,
+                "v_blanco": v_blanco,
+                "v_muestra": v_muestra,
+                "v_titulante": v_titulante,
+                "n_titulante": n_titulante
+            }
+
+            # Clasificar si es muestra
+            matriz_m, tipo_m = clasificar_muestra(_normalizar_texto(celda_actual))
+            if matriz_m:
+                pool_titulados[nombre_parametro]["muestras"][matriz_m][tipo_m].append(datos_lectura)
+                curr_row += 1
+                continue
+
+            # Clasificar si es estándar (MB, LCM, CCV, EA, RT)
+            std_code = None
+            if "BLANCO" in celda_actual: std_code = "MB"
+            elif "LIMITE" in celda_actual: std_code = "LCM"
+            elif "INTERMEDIO" in celda_actual or "CCV" in celda_actual: std_code = "CCV"
+            elif "ALTO" in celda_actual or "EA" in celda_actual: std_code = "EA"
+            elif "RANGO" in celda_actual or "RT" in celda_actual: std_code = "RT"
+
+            if std_code:
+                if std_code == "MB":
+                    datos_lectura["analista"] = "Analista 1" # Solo un blanco en FQ
+                pool_titulados[nombre_parametro][std_code].append(datos_lectura)
+
+            curr_row += 1
+
+    return pool_titulados
+
 def clasificar_codigo(codigo_raw: Any) -> str:
     c = str(codigo_raw).strip().upper()
     if c in ["MB", "LCM", "CCV", "EA", "RT"]:
@@ -420,6 +581,29 @@ def clasificar_codigo(codigo_raw: Any) -> str:
 def extraer_fecha(nombre_archivo: str) -> str:
     match = re.match(r"^(\d{4})(\d{2})(\d{2})", nombre_archivo)
     return f"{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else "Sin Fecha"
+
+def formatear_fecha_celda(valor: Any, respaldo: str = "Sin Fecha") -> str:
+    """Convierte el contenido de una celda de fecha del archivo principal a
+    'AAAA-MM-DD'. Si la celda está vacía devuelve `respaldo`."""
+    if valor is None:
+        return respaldo
+    try:
+        if pd.isna(valor):
+            return respaldo
+    except (TypeError, ValueError):
+        pass
+    if isinstance(valor, datetime):  # incluye pd.Timestamp
+        return valor.strftime("%Y-%m-%d")
+    # Fecha serial de Excel (celda con formato numérico)
+    if isinstance(valor, (int, float, np.integer, np.floating)) and 20000 < float(valor) < 80000:
+        try:
+            return pd.to_datetime(float(valor), unit="D", origin="1899-12-30").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() in ("nan", "nat"):
+        return respaldo
+    return texto.split()[0]
 
 def detectar_y_eliminar_outliers(datos, alpha=0.05):
     """Aplica la prueba de Grubbs iterativamente para detectar y remover datos atípicos."""
@@ -604,7 +788,219 @@ def calcular_estadistica_precision(datos_a1, datos_a2):
         "anova": anova_res
     }
     
-def procesar_hoja_fisicoquimico(contenido_bytes, fecha):
+def _a_float_o_none(valor: Any):
+    """Convierte una celda a float; devuelve None si está vacía o no es numérica."""
+    if valor is None:
+        return None
+    try:
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        num = float(str(valor).strip().replace(",", "."))
+    except ValueError:
+        return None
+    return None if (np.isnan(num) or np.isinf(num)) else num
+
+
+def leer_tablas_recuperacion(contenido_bytes: bytes, nombre_hoja: str) -> Dict[str, Dict[str, Any]]:
+    """Lee las tablas de 'Recuperación' de una hoja ('Datos' o 'Titulados').
+
+    Busca la palabra 'Recuperacion' (sin tildes, sin importar mayúsculas). En la
+    misma fila, la celda a la derecha trae el nombre del parámetro. Desde esa
+    celda de parámetro, y en su misma columna:
+        +2 filas -> vol_antes
+        +3 filas -> vol_muestra
+        +4 filas -> vol_adicionado
+        +5 filas -> conc_patron
+        +6 filas -> conc_adicionada
+    Devuelve {parametro_normalizado: {vol_antes, vol_muestra, vol_adicionado,
+    conc_patron, conc_adicionada}} con None en las celdas vacías.
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(contenido_bytes), sheet_name=nombre_hoja, header=None)
+    except Exception:
+        return {}
+
+    tablas = {}
+    filas, columnas = df.shape
+    campos = ["vol_antes", "vol_muestra", "vol_adicionado", "conc_patron", "conc_adicionada"]
+
+    for r in range(filas):
+        for c in range(columnas - 1):
+            if _normalizar_texto(df.iloc[r, c]) != "recuperacion":
+                continue
+            nombre_raw = df.iloc[r, c + 1]
+            nombre = _normalizar_texto(nombre_raw)
+            if nombre == "" or nombre == "nan":
+                continue
+
+            datos = {}
+            for k, campo in enumerate(campos):
+                fila_dato = r + 2 + k
+                datos[campo] = _a_float_o_none(df.iloc[fila_dato, c + 1]) if fila_dato < filas else None
+            tablas[nombre] = datos
+
+    return tablas
+
+
+def construir_muestras_planas_fisicoquimico(controles_muestras: Dict[str, Any], conc_patron: float, obtener_humedad=None, tipo_analisis: str = "estandar", params_recuperacion: Dict[str, Any] = None, nombre_parametro: str = "") -> tuple[Dict[str, list], Dict[str, float]]:
+    """Convierte las muestras Fisicoquímicas anidadas en listas planas para el frontend.
+
+    La estructura interna sigue siendo:
+        matriz -> normal/adicionada/duplicada -> lecturas
+
+    La salida queda como:
+        matriz -> [ {replica, normal, adicionada, duplicada, ...}, ... ]
+
+    Solo se construye una réplica cuando existen las tres lecturas correspondientes.
+
+    Cálculo del % de recuperación:
+      - Metales (params_recuperacion=None): volúmenes fijos 49 / 50 / 1 y
+        conc_patron recibido (balance de masa).
+      - Fisicoquímico: se toman de la tabla de Recuperación (params_recuperacion).
+          * Si vol_antes, vol_muestra y vol_adicionado tienen valor -> balance de masa
+            con esos volúmenes (y conc_patron de la tabla si existe).
+          * Si no, y conc_adicionada tiene valor -> concentración.
+          * Si no hay nada utilizable -> se usan los valores por defecto (49 / 50 / 1).
+    """
+    resultados_muestras = {}
+    humedades_aplicadas = {}
+
+    vol_antes = 49
+    vol_muestra = 50
+    vol_adicionado = 1
+    modo_recuperacion = "volumenes"
+    conc_adicionada = None
+
+    if params_recuperacion:
+        va = params_recuperacion.get("vol_antes")
+        vm = params_recuperacion.get("vol_muestra")
+        vad = params_recuperacion.get("vol_adicionado")
+        cp = params_recuperacion.get("conc_patron")
+        ca = params_recuperacion.get("conc_adicionada")
+
+        if va is not None and vm is not None and vad is not None:
+            vol_antes, vol_muestra, vol_adicionado = va, vm, vad
+            if cp is not None:
+                conc_patron = cp
+        elif ca:
+            modo_recuperacion = "concentracion"
+            conc_adicionada = ca
+        else:
+            print(f"[FQ] '{nombre_parametro}': la tabla de Recuperación no tiene volúmenes ni "
+                  f"conc_adicionada; se usan los valores por defecto (49/50/1).")
+    elif params_recuperacion is not None:
+        print(f"[FQ] '{nombre_parametro}': tabla de Recuperación vacía; se usan los valores por defecto (49/50/1).")
+
+    for matriz_name, datos_m in (controles_muestras or {}).items():
+        # Protección frente a estructuras antiguas/incompletas.
+        normal = datos_m.get("normal", [])
+        adicionada = datos_m.get("adicionada", [])
+        duplicada = datos_m.get("duplicada", [])
+
+        len_min = min(len(normal), len(adicionada))
+        if len_min == 0:
+            continue
+
+        res_matriz = []
+
+        for i in range(len_min):
+            dato_normal = normal[i]
+            dato_adic = adicionada[i]
+            dato_dup = duplicada[i] if i < len(duplicada) else None
+
+            try:
+                val_normal = float(dato_normal.get("valor", 0))
+                val_adic = float(dato_adic.get("valor", 0))
+                val_dup = float(dato_dup.get("valor", 0)) if dato_dup else None
+            except (TypeError, ValueError):
+                continue
+
+            def _rec(v):
+                if modo_recuperacion == "concentracion":
+                    # [(Conc_adicionada - Conc_muestra) / Conc_adicionada] * 100
+                    return ((v - val_normal) / conc_adicionada) * 100
+                num = abs(v * (vol_antes + vol_adicionado) - val_normal * vol_muestra)
+                return (num / (vol_adicionado * conc_patron) * 100) if (conc_patron and vol_adicionado) else 0
+
+            rec_adic = _rec(val_adic)
+            rec_dup = _rec(val_dup) if val_dup is not None else None
+            if val_dup is not None:
+                    prom = (val_adic + val_dup) / 2
+                    rpd = (abs(val_adic - val_dup) / prom * 100) if prom != 0 else 0
+            else:
+                    rpd = None
+
+            res_matriz.append({
+                "replica": i + 1,
+                "analista": dato_normal.get("analista"),
+                "fecha_normal": dato_normal.get("fecha"),
+                "fecha_adic": dato_adic.get("fecha"),
+                "fecha_dup": dato_dup.get("fecha") if dato_dup else None,
+                "normal": round(val_normal, 4),
+                "adicionada": round(val_adic, 4),
+                "duplicada": round(val_dup, 4) if val_dup is not None else None,
+                "recuperacion_adic": round(rec_adic, 2),
+                "recuperacion_dup": round(rec_dup, 2) if rec_dup is not None else None,
+                "rpd": round(rpd, 2) if rpd is not None else None,
+            })
+
+        if res_matriz:
+            resultados_muestras[matriz_name] = res_matriz
+
+            if (
+                tipo_analisis == "suelos"
+                and matriz_name in ("arenoso", "arcilloso", "limoso")
+                and obtener_humedad is not None
+            ):
+                humedades_aplicadas[matriz_name] = obtener_humedad(matriz_name)
+
+    return resultados_muestras, humedades_aplicadas
+
+
+def _normalizar_texto(valor: Any) -> str:
+    """Minúsculas, sin tildes y sin espacios extra (para comparar encabezados)."""
+    import unicodedata
+    txt = str(valor if valor is not None else "").strip().lower()
+    txt = unicodedata.normalize("NFD", txt)
+    txt = "".join(c for c in txt if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", txt)
+
+
+# Encabezados (fila PARAMETRO + 1) que indican que el valor es una SEÑAL y no una concentración
+_ENCABEZADOS_SENAL = ("absorbancia", "intensidad", "unidad de area", "unidades de area")
+
+
+def _tipo_columna_valores(encabezado: Any) -> str:
+    """'concentracion' | 'senal' según el encabezado de la columna de valores."""
+    t = _normalizar_texto(encabezado)
+    if "concentracion" in t:
+        return "concentracion"
+    if any(p in t for p in _ENCABEZADOS_SENAL):
+        return "senal"
+    return "concentracion"  # encabezado desconocido: se asume que ya es concentración
+
+
+def _buscar_curva(linealidad: Dict[str, Any], nombre_parametro: str):
+    """Devuelve (pendiente, intercepto) promedio del parámetro o (None, None)."""
+    if not linealidad:
+        return None, None
+    info = linealidad.get(nombre_parametro)
+    if info is None:
+        clave = _normalizar_texto(nombre_parametro)
+        for k, v in linealidad.items():
+            if _normalizar_texto(k) == clave:
+                info = v
+                break
+    if not info:
+        return None, None
+    st = info.get("stats", {})
+    return st.get("promedio_pendientes_raw"), st.get("intercepto_raw")
+
+
+def procesar_hoja_fisicoquimico(contenido_bytes, fecha, linealidad=None):
     """Extrae datos experimentales basándose en la ubicación de la palabra PARAMETRO.
     Detecta TODAS las apariciones de "PARAMETRO" en cualquier fila/columna de la
     hoja (no solo la primera de cada fila), y delimita cada bloque de datos usando
@@ -644,13 +1040,39 @@ def procesar_hoja_fisicoquimico(contenido_bytes, fecha):
  
         nombre_parametro = str(df.iloc[row_idx, col_param + 2]).strip()
         if nombre_parametro not in pool_fq:
-            pool_fq[nombre_parametro] = {"MB": [], "LCM": [], "CCV": [], "EA": []}
+            pool_fq[nombre_parametro] = {
+                "MB": [], "LCM": [], "CCV": [], "EA": [], "RT": [],
+                "muestras": {m: {"normal": [], "adicionada": [], "duplicada": []} for m in MATRICES_MUESTRAS}
+            }
  
         # Límite del bloque: la siguiente aparición de PARAMETRO en la misma
         # columna, o el final de la hoja si no hay otra
         siguientes = [f for f in filas_por_columna[col_param] if f > row_idx]
         fin_bloque = siguientes[0] if siguientes else filas
  
+        # Encabezado de la columna de valores: misma columna (col_param + 3 -> F),
+        # fila PARAMETRO + 1. Indica si se reporta Concentración o una señal
+        # (Absorbancia, Intensidad, Unidad de Área).
+        encabezado = df.iloc[row_idx + 1, col_param + 3] if (row_idx + 1 < filas and col_param + 3 < columnas) else ""
+        es_senal = _tipo_columna_valores(encabezado) == "senal"
+        pendiente, intercepto = (None, None)
+        if es_senal:
+            pendiente, intercepto = _buscar_curva(linealidad, nombre_parametro)
+            if not pendiente:
+                print(f"[FQ] '{nombre_parametro}': valores en señal ('{encabezado}') pero no hay "
+                      f"curva/pendiente en la hoja 'Curvas'; se omiten los datos de este bloque.")
+
+        def leer_fd(fila):
+            """Factor de dilución: misma fila, columna siguiente a la del valor
+            (col_param + 4). Si está vacío o no es numérico se asume 1."""
+            if col_param + 4 >= columnas:
+                return 1.0
+            try:
+                fd = float(str(df.iloc[fila, col_param + 4]).replace(",", "."))
+                return 1.0 if np.isnan(fd) else fd
+            except ValueError:
+                return 1.0
+
         # Sumar 2 filas para empezar a leer los estándares
         curr_row = row_idx + 2
  
@@ -661,7 +1083,41 @@ def procesar_hoja_fisicoquimico(contenido_bytes, fecha):
                 curr_row += 1
                 continue
  
-            # 4. Clasificar el estándar
+            # 4a. Clasificar si la fila es una MUESTRA (agua superficial, agua subterranea,
+            #     ar domestica, ar no domestica, suelos; normal / adicionada / duplicada).
+            #     Se evalúa primero porque, por ejemplo, "SUBTERRANEA" contiene "EA" y se
+            #     confundiría con el estándar EA. Se normaliza para tolerar tildes.
+            matriz_m, tipo_m = clasificar_muestra(_normalizar_texto(celda_actual))
+            if matriz_m and col_param + 3 < columnas:
+                analista_raw = str(df.iloc[curr_row, col_param + 1]).strip()
+                analista = "Analista 1" if "1" in analista_raw else "Analista 2"
+                valor_raw = df.iloc[curr_row, col_param + 3]
+                try:
+                    valor = float(str(valor_raw).replace(",", "."))
+                    if np.isnan(valor):
+                        raise ValueError
+                    if es_senal:
+                        if not pendiente:
+                            curr_row += 1
+                            continue
+                        # Concentración = (señal - intercepto) / pendiente
+                        valor = (valor - intercepto) / pendiente
+                    valor = valor * leer_fd(curr_row)
+                    fecha_fila = (
+                        formatear_fecha_celda(df.iloc[curr_row, col_param - 1], fecha)
+                        if col_param >= 1 else fecha
+                    )
+                    pool_fq[nombre_parametro]["muestras"][matriz_m][tipo_m].append({
+                        "valor": valor,
+                        "fecha": fecha_fila,
+                        "analista": analista
+                    })
+                except ValueError:
+                    pass
+                curr_row += 1
+                continue
+
+            # 4b. Clasificar el estándar
             std_code = None
             if "BLANCO" in celda_actual:
                 std_code = "MB"
@@ -671,11 +1127,16 @@ def procesar_hoja_fisicoquimico(contenido_bytes, fecha):
                 std_code = "CCV"
             elif "ALTO" in celda_actual or "EA" in celda_actual:
                 std_code = "EA"
- 
+            elif "RANGO" in celda_actual or "RT" in celda_actual:
+                std_code = "RT"
+                
             if std_code and col_param + 3 < columnas:
                 # 5. Columna + 1: Analista
                 analista_raw = str(df.iloc[curr_row, col_param + 1]).strip()
                 analista = "Analista 1" if "1" in analista_raw else "Analista 2"
+                # Fisicoquímico: se usa un único blanco, el del Analista 1
+                if std_code == "MB":
+                    analista = "Analista 1"
  
                 # (La Columna + 2 son las unidades, se omite de la extracción de valores)
  
@@ -683,9 +1144,25 @@ def procesar_hoja_fisicoquimico(contenido_bytes, fecha):
                 valor_raw = df.iloc[curr_row, col_param + 3]
                 try:
                     valor = float(str(valor_raw).replace(",", "."))
+                    if es_senal:
+                        if not pendiente:
+                            curr_row += 1
+                            continue
+                        # Concentración = (señal - intercepto) / pendiente
+                        valor = (valor - intercepto) / pendiente
+                    # Factor de dilución: aplica a señal y a concentración
+                    if std_code != "RT":
+                        valor = valor * leer_fd(curr_row)
+                        
+                    # La fecha está en la columna inmediatamente anterior a la del
+                    # Estándar (si el estándar está en C4, la fecha está en B4).
+                    fecha_fila = (
+                        formatear_fecha_celda(df.iloc[curr_row, col_param - 1], fecha)
+                        if col_param >= 1 else fecha
+                    )
                     pool_fq[nombre_parametro][std_code].append({
                         "valor": valor,
-                        "fecha": fecha,
+                        "fecha": fecha_fila,
                         "analista": analista
                     })
                 except ValueError:
@@ -870,21 +1347,51 @@ async def procesar_datos(
     elementos_detectados = set(teoricos.keys())
     pool = {elem: {"MB": [], "LCM": [], "CCV": [], "EA": [], "RT": [], "muestras": {m: {"normal": [], "adicionada": [], "duplicada": []} for m in MATRICES_MUESTRAS}} for elem in elementos_detectados}
 
+    # Tablas de Recuperación (solo fisicoquímico): hoja 'Datos' para los no titulados
+    # y hoja 'Titulados' para los titulados. Clave: nombre de parámetro normalizado.
+    recuperacion_datos: Dict[str, Dict[str, Any]] = {}
+    recuperacion_titulados: Dict[str, Dict[str, Any]] = {}
+
     for archivo in archivos_qc:
         if not archivo.filename.endswith(('.xls', '.xlsx')):
             continue
-            
+
         fecha = extraer_fecha(archivo.filename)
         contenido = await archivo.read()
-        
+
         if area_analisis == "fisicoquimico":
-            datos_extraidos_fq = procesar_hoja_fisicoquimico(contenido, fecha)
+            for _clave, _tabla in leer_tablas_recuperacion(contenido, "Datos").items():
+                recuperacion_datos[_clave] = _tabla
+            for _clave, _tabla in leer_tablas_recuperacion(contenido, "Titulados").items():
+                recuperacion_titulados[_clave] = _tabla
+
+            datos_extraidos_fq = procesar_hoja_fisicoquimico(contenido, fecha, linealidad_global)
+            
+            datos_extraidos_titulados = procesar_hoja_titulados(contenido, fecha)
+            
+            todas_extracciones_fq = {**datos_extraidos_fq, **datos_extraidos_titulados}
+            
             # Volcar datos al pool principal
-            for parametro, controles_fq in datos_extraidos_fq.items():
+            for parametro, controles_fq in todas_extracciones_fq.items():
                 # Asegurar que el parámetro exista en el archivo de configuración teórico
                 if parametro in pool:
+                    
+                    if controles_fq.get("es_titulado"):
+                        pool[parametro]["es_titulado"] = True
+                    
                     for tipo_ctrl, data_list in controles_fq.items():
-                        pool[parametro][tipo_ctrl].extend(data_list)
+                        if tipo_ctrl == "es_titulado":
+                            continue
+                        if tipo_ctrl == "muestras":
+                            for matriz_m, tipos in data_list.items():
+                                # Suelos solo si el análisis es de suelos; en otro caso se ignoran
+                                es_suelo_m = matriz_m in MATRICES_SUELO
+                                if (tipo_analisis == "suelos") != es_suelo_m:
+                                    continue
+                                for tipo_m, lista_m in tipos.items():
+                                    pool[parametro]["muestras"][matriz_m][tipo_m].extend(lista_m)
+                        else:
+                            pool[parametro][tipo_ctrl].extend(data_list)
                         
         else:
             try:
@@ -893,7 +1400,11 @@ async def procesar_datos(
                 col_d = df.iloc[:, 3] if df.shape[1] > 3 else None
                 col_f = df.iloc[:, 5] if df.shape[1] > 5 else None
                 col_n = df.iloc[:, 13] if df.shape[1] > 13 else None  # Columna N para pesos
-                col_u = df.iloc[:, 20] if df.shape[1] > 20 else None
+                # Fecha: columna U (combinada con V) en metales; columna AC
+                # (combinada con AD) cuando la matriz es suelos.
+                idx_col_fecha = 28 if tipo_analisis == "suelos" else 20
+                col_fecha = df.iloc[:, idx_col_fecha] if df.shape[1] > idx_col_fecha else None
+                col_fecha_comb = df.iloc[:, idx_col_fecha + 1] if df.shape[1] > idx_col_fecha + 1 else None
                 
                 if col_b is None or col_d is None or col_f is None:
                     continue
@@ -913,11 +1424,14 @@ async def procesar_datos(
                 for idx in range(len(df)):
                     val_d = col_d.iloc[idx]
 
-                    # Fecha de esta fila: se toma de la columna U; si está vacía,
+                    # Fecha de esta fila: se toma de la columna U (AC en suelos); si está vacía,
                     # se usa como respaldo la fecha extraída del nombre del archivo.
                     # Solo se usa para "anclar" fecha_bloque_actual/fecha_bloque_robustez
                     # en la fila donde se detecta el rótulo correspondiente.
-                    fecha_u = str(col_u.iloc[idx]).split()[0] if col_u is not None and pd.notna(col_u.iloc[idx]) else fecha
+                    celda_fecha = col_fecha.iloc[idx] if col_fecha is not None else None
+                    if (celda_fecha is None or pd.isna(celda_fecha)) and col_fecha_comb is not None:
+                        celda_fecha = col_fecha_comb.iloc[idx]
+                    fecha_u = formatear_fecha_celda(celda_fecha, fecha)
 
                     # Gestión dinámica del código actual y captura de peso
                     if pd.notna(val_d) and str(val_d).strip() != "":
@@ -1124,6 +1638,10 @@ async def procesar_datos(
     resultados = {}
     for elem, controles in pool.items():
         mb_datos = controles["MB"]
+        # Fisicoquímico: solo cuenta el blanco del Analista 1 (LOD/LOQ, tablas y gráficas)
+        es_fq = (area_analisis == "fisicoquimico")
+        if es_fq:
+            mb_datos = [d for d in mb_datos if d["analista"] == "Analista 1"]
         lcm_datos = controles["LCM"]
         ccv_datos = controles["CCV"]
         ea_datos = controles["EA"]
@@ -1195,6 +1713,7 @@ async def procesar_datos(
         loq_posible = round(10 * stats_mb_global["desviacion"], 4)
 
         resultados[elem] = {
+            "es_titulado": controles.get("es_titulado", False),
             "teorico_lcm": val_teorico_lcm,
             "teorico_ccv": val_teorico_ccv,
             "teorico_ea": val_teorico_ea,
@@ -1203,6 +1722,7 @@ async def procesar_datos(
             "outliers": outliers_globales[elem],
             "exactitud": exactitud_global[elem],
             "mb": {
+                "solo_analista_1": es_fq,
                 "global": stats_mb_global,
                 "analista_1": stats_mb_a1,
                 "analista_2": stats_mb_a2,
@@ -1246,51 +1766,32 @@ async def procesar_datos(
             "robustez": robustez_global.get(elem, None)
         }
 
-        # --- Cálculo de recuperación/RPD por matriz de muestras ---
-        vol_antes = 49
-        vol_muestra = 50
-        vol_adicionado = 1
-        conc_patron = 1000 if elem in GRUPO_2 else 10
+        # --- Aplanamiento de muestras para Fisicoquímica ---
+        # La estructura interna del pool sigue siendo anidada para poder
+        # acumular lecturas de varias hojas/archivos. Solo aquí se transforma
+        # la salida al formato plano que consume el frontend.
+        conc_patron_muestras = 1000 if elem in GRUPO_2 else 10
 
-        resultados[elem]["muestras"] = {}
-        resultados[elem]["humedad_aplicada_matrices"] = {}
-        for matriz_name, datos_m in controles.get("muestras", {}).items():
-            res_matriz = []
-            len_min = min(len(datos_m["normal"]), len(datos_m["adicionada"]), len(datos_m["duplicada"]))
+        # Metales: se mantiene el cálculo anterior (49/50/1 y patrón fijo).
+        # Fisicoquímico: volúmenes y patrón salen de la tabla de Recuperación
+        # (hoja 'Titulados' si el parámetro es titulado; hoja 'Datos' si no).
+        params_recuperacion = None
+        if area_analisis == "fisicoquimico":
+            tabla_rec = recuperacion_titulados if controles.get("es_titulado") else recuperacion_datos
+            params_recuperacion = tabla_rec.get(_normalizar_texto(elem), {})
 
-            for i in range(len_min):
-                val_normal = datos_m["normal"][i]["valor"]
-                val_adic = datos_m["adicionada"][i]["valor"]
-                val_dup = datos_m["duplicada"][i]["valor"]
+        (
+            resultados[elem]["muestras"],
+            resultados[elem]["humedad_aplicada_matrices"]
+        ) = construir_muestras_planas_fisicoquimico(
+            controles.get("muestras", {}),
+            conc_patron_muestras,
+            obtener_humedad=obtener_humedad,
+            tipo_analisis=tipo_analisis,
+            params_recuperacion=params_recuperacion,
+            nombre_parametro=elem
+        )
 
-                # Porcentajes de Recuperación
-                numerador_adic = abs(val_adic * (vol_antes + vol_adicionado) - (val_normal * vol_muestra))
-                rec_adic = (numerador_adic / (vol_adicionado * conc_patron)) * 100
-
-                numerador_dup = abs(val_dup * (vol_antes + vol_adicionado) - (val_normal * vol_muestra))
-                rec_dup = (numerador_dup / (vol_adicionado * conc_patron)) * 100
-
-                # Porcentaje RPD
-                prom_adic_dup = (val_adic + val_dup) / 2
-                rpd = (abs(val_adic - val_dup) / prom_adic_dup * 100) if prom_adic_dup != 0 else 0
-
-                res_matriz.append({
-                    "replica": i + 1,
-                    "analista": datos_m["normal"][i]["analista"],
-                    "normal": round(val_normal, 4),
-                    "adicionada": round(val_adic, 4),
-                    "duplicada": round(val_dup, 4),
-                    "recuperacion_adic": round(rec_adic, 2),
-                    "recuperacion_dup": round(rec_dup, 2),
-                    "rpd": round(rpd, 2)
-                })
-
-            # Solo agregar al JSON si se encontraron réplicas para esta matriz
-            if res_matriz:
-                resultados[elem]["muestras"][matriz_name] = res_matriz
-                if tipo_analisis == "suelos" and matriz_name in ["arenoso", "arcilloso", "limoso"]:
-                    resultados[elem]["humedad_aplicada_matrices"][matriz_name] = obtener_humedad(matriz_name)
-                    
     if tipo_analisis == "ras":
         nombres_ras = {"Ca": "Ca soluble", "Mg": "Mg soluble", "Na": "Na soluble", "K": "K soluble"}
         resultados_finales = {}
