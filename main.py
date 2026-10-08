@@ -196,8 +196,12 @@ def clasificar_muestra(codigo_raw: Any):
     else:
         return None, None
 
-    if "adicionad" in c: return matriz, "adicionada"
+    # "DUPLICADO" siempre se clasifica como duplicada (incluso si el texto también
+    # dice "adicionada"). Si es duplicado del adicionado o de la muestra se decide
+    # después, por matriz, en construir_muestras_planas_fisicoquimico: si para esa
+    # matriz existe el adicionado, el duplicado lo es del adicionado; si no, de la muestra.
     if "duplicad" in c: return matriz, "duplicada"
+    if "adicionad" in c: return matriz, "adicionada"
     return matriz, "normal"
 
 def es_simbolo_quimico(valor: Any) -> bool:
@@ -900,7 +904,12 @@ def construir_muestras_planas_fisicoquimico(controles_muestras: Dict[str, Any], 
         adicionada = datos_m.get("adicionada", [])
         duplicada = datos_m.get("duplicada", [])
 
-        len_min = min(len(normal), len(adicionada))
+        # Regla del DUPLICADO: si la matriz tiene adicionado, el duplicado es el
+        # duplicado del adicionado (RPD sobre el adicionado). Si no, es el duplicado
+        # de la muestra (RPD sobre la muestra normal).
+        hay_adic = len(adicionada) > 0
+        duplicado_de = "adicionada" if hay_adic else "normal"
+        len_min = min(len(normal), len(adicionada)) if hay_adic else len(normal)
         if len_min == 0:
             continue
 
@@ -908,12 +917,12 @@ def construir_muestras_planas_fisicoquimico(controles_muestras: Dict[str, Any], 
 
         for i in range(len_min):
             dato_normal = normal[i]
-            dato_adic = adicionada[i]
+            dato_adic = adicionada[i] if hay_adic else None
             dato_dup = duplicada[i] if i < len(duplicada) else None
 
             try:
                 val_normal = float(dato_normal.get("valor", 0))
-                val_adic = float(dato_adic.get("valor", 0))
+                val_adic = float(dato_adic.get("valor", 0)) if dato_adic else None
                 val_dup = float(dato_dup.get("valor", 0)) if dato_dup else None
             except (TypeError, ValueError):
                 continue
@@ -925,11 +934,13 @@ def construir_muestras_planas_fisicoquimico(controles_muestras: Dict[str, Any], 
                 num = abs(v * (vol_antes + vol_adicionado) - val_normal * vol_muestra)
                 return (num / (vol_adicionado * conc_patron) * 100) if (conc_patron and vol_adicionado) else 0
 
-            rec_adic = _rec(val_adic)
-            rec_dup = _rec(val_dup) if val_dup is not None else None
+            rec_adic = _rec(val_adic) if val_adic is not None else None
+            # Recuperación del duplicado solo tiene sentido si es duplicado del adicionado
+            rec_dup = _rec(val_dup) if (val_dup is not None and hay_adic) else None
             if val_dup is not None:
-                    prom = (val_adic + val_dup) / 2
-                    rpd = (abs(val_adic - val_dup) / prom * 100) if prom != 0 else 0
+                    base = val_adic if hay_adic else val_normal
+                    prom = (base + val_dup) / 2
+                    rpd = (abs(base - val_dup) / prom * 100) if prom != 0 else 0
             else:
                     rpd = None
 
@@ -937,12 +948,13 @@ def construir_muestras_planas_fisicoquimico(controles_muestras: Dict[str, Any], 
                 "replica": i + 1,
                 "analista": dato_normal.get("analista"),
                 "fecha_normal": dato_normal.get("fecha"),
-                "fecha_adic": dato_adic.get("fecha"),
+                "fecha_adic": dato_adic.get("fecha") if dato_adic else None,
                 "fecha_dup": dato_dup.get("fecha") if dato_dup else None,
                 "normal": round(val_normal, 4),
-                "adicionada": round(val_adic, 4),
+                "adicionada": round(val_adic, 4) if val_adic is not None else None,
+                "duplicado_de": duplicado_de,
                 "duplicada": round(val_dup, 4) if val_dup is not None else None,
-                "recuperacion_adic": round(rec_adic, 2),
+                "recuperacion_adic": round(rec_adic, 2) if rec_adic is not None else None,
                 "recuperacion_dup": round(rec_dup, 2) if rec_dup is not None else None,
                 "rpd": round(rpd, 2) if rpd is not None else None,
             })
