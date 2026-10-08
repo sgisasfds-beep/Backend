@@ -1659,8 +1659,8 @@ async def procesar_datos(
         ea_datos = controles["EA"]
         rt_datos = controles["RT"]
         
-        if not mb_datos or not lcm_datos:
-            continue
+        #if not mb_datos or not lcm_datos:
+            #continue
 
         val_teorico_lcm = teoricos.get(elem, {}).get("LCM", 0.0)
         val_teorico_ccv = teoricos.get(elem, {}).get("CCV", 0.0)
